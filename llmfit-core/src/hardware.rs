@@ -138,10 +138,13 @@ impl SystemSpecs {
         }
 
         // AMD GPUs via rocm-smi or sysfs
-        if let Some(amd) = Self::detect_amd_gpu_rocm_info() {
-            gpus.push(amd);
-        } else if let Some(amd) = Self::detect_amd_gpu_sysfs_info() {
-            gpus.push(amd);
+        let amd_rocm = Self::detect_amd_gpu_rocm_info();
+        if amd_rocm.is_empty() {
+            if let Some(amd) = Self::detect_amd_gpu_sysfs_info() {
+                gpus.push(amd);
+            }
+        } else {
+            gpus.extend(amd_rocm);
         }
 
         // Windows WMI (catches GPUs not found by vendor-specific tools)
@@ -161,19 +164,26 @@ impl SystemSpecs {
         // These share the full system RAM between CPU and GPU, like Apple Silicon.
         // WMI AdapterRAM is a 32-bit field capped at ~4 GB, so we override with
         // total system RAM for these APUs.
+        //
+        // On Windows, BIOS GPU UMA carveouts cause sysinfo to report only the
+        // CPU-accessible portion (e.g. 32 GB on a 128 GB system where 96 GB is
+        // allocated to the GPU). Query total physical DIMM capacity via
+        // Win32_PhysicalMemory, which reads SMBIOS and is unaffected by the
+        // carveout, so model fit estimates reflect the full memory pool.
         if is_amd_unified_memory_apu(cpu_name) {
+            let apu_pool_gb = detect_windows_physical_total_ram_gb().unwrap_or(total_ram_gb);
             let amd_idx = gpus.iter().position(|g| {
                 let lower = g.name.to_lowercase();
                 lower.contains("amd") || lower.contains("radeon")
             });
             if let Some(idx) = amd_idx {
                 gpus[idx].unified_memory = true;
-                gpus[idx].vram_gb = Some(total_ram_gb);
+                gpus[idx].vram_gb = Some(apu_pool_gb);
             } else {
                 // No AMD GPU found via other methods; create one.
                 gpus.push(GpuInfo {
                     name: format!("{} (integrated)", cpu_name),
-                    vram_gb: Some(total_ram_gb),
+                    vram_gb: Some(apu_pool_gb),
                     backend: GpuBackend::Vulkan,
                     count: 1,
                     unified_memory: true,
@@ -234,7 +244,20 @@ impl SystemSpecs {
         }
 
         // Vulkan fallback (e.g. Android/Termux with Turnip)
+        let has_rocm_gpu = gpus.iter().any(|g| g.backend == GpuBackend::Rocm);
         for vulkan_gpu in Self::detect_vulkan_gpu_info() {
+            // When a ROCm AMD GPU is already detected, skip any Vulkan AMD/RADV
+            // devices — they represent the same physical GPU and ROCm is the
+            // higher-quality detection path (provides real VRAM and product name).
+            if has_rocm_gpu {
+                let vk_lower = vulkan_gpu.name.to_lowercase();
+                if vk_lower.contains("amd")
+                    || vk_lower.contains("radeon")
+                    || vk_lower.contains("radv")
+                {
+                    continue;
+                }
+            }
             let dominated = gpus
                 .iter()
                 .any(|existing| Self::is_same_gpu_name(&existing.name, &vulkan_gpu.name));
@@ -242,6 +265,12 @@ impl SystemSpecs {
                 gpus.push(vulkan_gpu);
             }
         }
+
+        // When both discrete and integrated GPUs are present, drop the
+        // integrated GPUs so the discrete GPU becomes primary. This applies
+        // globally, not just to the Windows WMI path, to handle cases where
+        // an iGPU is detected via Vulkan or APU detection alongside a dGPU.
+        gpus = Self::prefer_discrete_gpus(gpus);
 
         // Sort by VRAM descending so the best GPU is primary
         gpus.sort_by(|a, b| {
@@ -514,31 +543,43 @@ impl SystemSpecs {
         })
     }
 
-    /// Detect AMD GPU via rocm-smi (available on Linux with ROCm installed).
-    /// Parses per-card VRAM and GPU name from rocm-smi output.
-    fn detect_amd_gpu_rocm_info() -> Option<GpuInfo> {
-        // Try rocm-smi --showmeminfo vram for VRAM
-        let vram_output = std::process::Command::new("rocm-smi")
+    /// Detect AMD GPUs via rocm-smi (available on Linux with ROCm installed).
+    /// Parses per-card VRAM and GPU name from rocm-smi output, returning one
+    /// `GpuInfo` per distinct GPU model (like `detect_nvidia_gpus`).
+    fn detect_amd_gpu_rocm_info() -> Vec<GpuInfo> {
+        let vram_output = match std::process::Command::new("rocm-smi")
             .arg("--showmeminfo")
             .arg("vram")
             .output()
-            .ok()?;
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        let vram_text = match String::from_utf8(vram_output.stdout) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
 
-        if !vram_output.status.success() {
-            return None;
-        }
+        let product_text = std::process::Command::new("rocm-smi")
+            .arg("--showproductname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok());
 
-        let vram_text = String::from_utf8(vram_output.stdout).ok()?;
+        Self::parse_rocm_smi_output(&vram_text, product_text.as_deref())
+    }
 
-        // Parse VRAM total from rocm-smi output.
-        // Typical format includes a line like:
-        //   "GPU[0] : vram Total Memory (B): 8589934592"
-        // or in table format with "Total" and bytes.
+    /// Parse rocm-smi `--showmeminfo vram` and `--showproductname` output
+    /// into one `GpuInfo` per distinct GPU model. Identical models are
+    /// grouped with a `count` field, like `parse_nvidia_smi_list`.
+    fn parse_rocm_smi_output(vram_text: &str, product_text: Option<&str>) -> Vec<GpuInfo> {
+        // Parse per-GPU VRAM total.
+        // Typical format: "GPU[0] : VRAM Total Memory (B): 8589934592"
         let mut per_gpu_vram_bytes: Vec<u64> = Vec::new();
         for line in vram_text.lines() {
             let lower = line.to_lowercase();
             if lower.contains("total") && !lower.contains("used") {
-                // Extract the numeric value (bytes)
                 if let Some(val) = line
                     .split_whitespace()
                     .filter_map(|w| w.parse::<u64>().ok())
@@ -550,68 +591,77 @@ impl SystemSpecs {
             }
         }
 
+        // Parse per-GPU names from --showproductname.
+        // Format: "GPU[0] : Card Series: AMD Radeon RX 7600"
+        let per_gpu_names: Vec<String> = product_text
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| {
+                        let lower = line.to_lowercase();
+                        if lower.contains("card series") {
+                            line.rsplit(':')
+                                .next()
+                                .map(|n| n.trim().to_string())
+                                .filter(|n| !n.is_empty())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // Filter out integrated GPUs (iGPUs) that have very little VRAM.
         // rocm-smi reports all GPU agents including iGPUs on APUs like
         // Ryzen 9800X3D, which would otherwise inflate the GPU count.
-        // Discrete GPUs have >= 2 GB VRAM; iGPUs typically show < 1 GB.
+        // Discrete GPUs have > 2 GB VRAM; iGPUs typically show <= 2 GB.
         const IGPU_VRAM_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
-        let discrete_vram: Vec<u64> = per_gpu_vram_bytes
-            .iter()
-            .copied()
-            .filter(|&v| v >= IGPU_VRAM_THRESHOLD)
-            .collect();
-        let (effective_vram, gpu_count) = if discrete_vram.is_empty() {
-            // No discrete GPUs found; use all entries (may be an iGPU-only system)
-            (per_gpu_vram_bytes, 1u32)
-        } else {
-            let count = discrete_vram.len() as u32;
-            (discrete_vram, count)
-        };
+        let has_discrete = per_gpu_vram_bytes.iter().any(|&v| v > IGPU_VRAM_THRESHOLD);
 
-        // Try to get GPU name from rocm-smi --showproductname
-        let gpu_name = std::process::Command::new("rocm-smi")
-            .arg("--showproductname")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
+        // Pair each GPU index with its name and VRAM, filtering iGPUs when
+        // discrete GPUs are present.
+        let gpu_count = per_gpu_vram_bytes.len().max(per_gpu_names.len());
+        let mut grouped: std::collections::BTreeMap<String, (u32, u64)> =
+            std::collections::BTreeMap::new();
+
+        for i in 0..gpu_count {
+            let vram = per_gpu_vram_bytes.get(i).copied().unwrap_or(0);
+            if has_discrete && vram <= IGPU_VRAM_THRESHOLD {
+                continue; // skip iGPU
+            }
+            let name = per_gpu_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "AMD GPU".to_string());
+            let entry = grouped.entry(name).or_insert((0, 0));
+            entry.0 += 1;
+            if vram > entry.1 {
+                entry.1 = vram;
+            }
+        }
+
+        if grouped.is_empty() {
+            return Vec::new();
+        }
+
+        grouped
+            .into_iter()
+            .map(|(name, (count, vram_bytes))| {
+                let vram_gb = if vram_bytes > 0 {
+                    Some(vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
                 } else {
-                    None
+                    let est = estimate_vram_from_name(&name);
+                    if est > 0.0 { Some(est) } else { None }
+                };
+                GpuInfo {
+                    name,
+                    vram_gb,
+                    backend: GpuBackend::Rocm,
+                    count,
+                    unified_memory: false,
                 }
             })
-            .and_then(|text| {
-                // Look for "Card Series" or "Card Model" lines
-                for line in text.lines() {
-                    let lower = line.to_lowercase();
-                    if (lower.contains("card series") || lower.contains("card model"))
-                        && let Some(val) = line.split(':').nth(1)
-                    {
-                        let name = val.trim().to_string();
-                        if !name.is_empty() {
-                            return Some(name);
-                        }
-                    }
-                }
-                None
-            });
-
-        let name = gpu_name.unwrap_or_else(|| "AMD GPU".to_string());
-        let max_per_gpu_bytes = effective_vram.into_iter().max().unwrap_or(0);
-        let vram_gb = if max_per_gpu_bytes > 0 {
-            Some(max_per_gpu_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else {
-            let est = estimate_vram_from_name(&name);
-            if est > 0.0 { Some(est) } else { None }
-        };
-
-        Some(GpuInfo {
-            name,
-            vram_gb,
-            backend: GpuBackend::Rocm,
-            count: gpu_count,
-            unified_memory: false,
-        })
+            .collect()
     }
 
     /// Detect AMD GPU via sysfs on Linux (works without ROCm installed).
@@ -945,6 +995,11 @@ impl SystemSpecs {
     fn is_integrated_gpu_name(name: &str) -> bool {
         let lower = name.to_lowercase();
 
+        // Explicitly tagged as integrated (e.g. from APU detection path)
+        if lower.contains("(integrated)") {
+            return true;
+        }
+
         // Intel integrated: UHD, HD Graphics, Iris (but NOT Intel Arc discrete)
         if lower.contains("intel") {
             return lower.contains("uhd")
@@ -1158,8 +1213,54 @@ impl SystemSpecs {
     }
 
     fn is_same_gpu_name(existing_name: &str, candidate_name: &str) -> bool {
-        Self::normalize_gpu_name_for_dedupe(existing_name)
+        if Self::normalize_gpu_name_for_dedupe(existing_name)
             == Self::normalize_gpu_name_for_dedupe(candidate_name)
+        {
+            return true;
+        }
+
+        // ROCm reports AMD GPUs using a generic family name that lists multiple
+        // model variants separated by "/" (e.g. "Radeon RX 7700S/7600/7600S/7600M
+        // XT/PRO W7600"), while Vulkan/RADV reports the specific model with a
+        // driver codename suffix (e.g. "AMD Radeon RX 7600 XT (RADV NAVI33)").
+        // These refer to the same physical GPU but never match via exact
+        // normalization, so we do a secondary check: if both names contain "amd"
+        // or "radeon" and share at least one 3-5 digit model number, treat them
+        // as the same device.
+        let e_lower = existing_name.to_lowercase();
+        let c_lower = candidate_name.to_lowercase();
+        let is_amd = |s: &str| s.contains("radeon") || s.starts_with("amd ") || s.contains(" amd ");
+        if is_amd(&e_lower) && is_amd(&c_lower) {
+            let e_nums = Self::extract_gpu_model_numbers(&e_lower);
+            let c_nums = Self::extract_gpu_model_numbers(&c_lower);
+            if !e_nums.is_empty() && e_nums.iter().any(|n| c_nums.contains(n)) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Extract 3-5 digit numeric tokens from a GPU name (e.g. "7600", "6800").
+    /// Used to compare AMD family names from ROCm against specific model names
+    /// from Vulkan/RADV for deduplication.
+    fn extract_gpu_model_numbers(name: &str) -> Vec<String> {
+        let mut numbers = Vec::new();
+        let mut current = String::new();
+        for c in name.chars() {
+            if c.is_ascii_digit() {
+                current.push(c);
+            } else {
+                if current.len() >= 3 && current.len() <= 5 {
+                    numbers.push(current.clone());
+                }
+                current.clear();
+            }
+        }
+        if current.len() >= 3 && current.len() <= 5 {
+            numbers.push(current);
+        }
+        numbers
     }
 
     fn normalize_gpu_name_for_dedupe(name: &str) -> String {
@@ -1215,10 +1316,23 @@ impl SystemSpecs {
 
     fn is_software_vulkan_device(name: &str) -> bool {
         let lower = name.to_lowercase();
-        lower.contains("llvmpipe")
+        // Software rasterizers / CPU emulation
+        if lower.contains("llvmpipe")
             || lower.contains("lavapipe")
             || lower.contains("swiftshader")
             || lower.contains("software rasterizer")
+        {
+            return true;
+        }
+        // CPU compute devices exposed as Vulkan by Mesa/RADV.
+        // These appear when ROCm or Mesa exposes the CPU's compute
+        // engine as a Vulkan device (e.g. "AMD Ryzen 7 9800X3D
+        // 8-Core Processor (RADV RAPHAEL_MENDOCINO)").  CPUs are
+        // not inference GPUs and should never be scored as one.
+        if lower.contains("core processor") {
+            return true;
+        }
+        false
     }
 
     /// Detect Ascend NPUs via npu-smi. Returns a vector of NPU info.
@@ -1473,6 +1587,31 @@ impl SystemSpecs {
         self
     }
 
+    /// Override total and available system RAM with a user-specified value (in GB).
+    /// Sets available RAM to 90% of the override to model typical system usage.
+    /// On unified-memory systems (Apple Silicon), this also updates GPU VRAM
+    /// to stay consistent — use `--memory` after `--ram` to override VRAM separately.
+    pub fn with_ram_override(mut self, ram_gb: f64) -> Self {
+        self.total_ram_gb = ram_gb;
+        self.available_ram_gb = ram_gb * 0.9;
+        if self.unified_memory {
+            self.gpu_vram_gb = Some(ram_gb);
+            self.total_gpu_vram_gb = Some(ram_gb);
+            for gpu in &mut self.gpus {
+                if gpu.unified_memory {
+                    gpu.vram_gb = Some(ram_gb);
+                }
+            }
+        }
+        self
+    }
+
+    /// Override the detected CPU core count with a user-specified value.
+    pub fn with_cpu_core_override(mut self, cores: usize) -> Self {
+        self.total_cpu_cores = cores;
+        self
+    }
+
     pub fn display(&self) {
         println!("\n=== System Specifications ===");
         println!("CPU: {} ({} cores)", self.cpu_name, self.total_cpu_cores);
@@ -1601,15 +1740,52 @@ fn detect_running_in_wsl() -> bool {
 /// All Ryzen AI APUs have integrated Radeon GPUs that share system memory.
 fn is_amd_unified_memory_apu(cpu_name: &str) -> bool {
     let lower = cpu_name.to_lowercase();
-    // All "Ryzen AI" branded APUs use unified/shared memory.
-    // Examples:
+    // Only "Ryzen AI MAX" / "Ryzen AI MAX+" APUs have a large unified memory
+    // pool shared between CPU and GPU (similar to Apple Silicon).
+    // Regular Ryzen AI chips (e.g. HX 370, HX 365) have a standard small iGPU
+    // and should NOT be treated as unified-memory systems.
+    // Examples that match:
     //   "AMD Ryzen AI MAX+ 395 w/ Radeon 8060S"
-    //   "AMD Ryzen AI 9 HX 370 w/ Radeon 890M"
-    //   "AMD Ryzen AI 7 350"
-    if lower.contains("ryzen ai") {
+    //   "AMD Ryzen AI MAX 390"
+    if lower.contains("ryzen ai max") {
         return true;
     }
     false
+}
+
+/// Query total installed physical RAM on Windows by summing DIMM capacities
+/// from WMI `Win32_PhysicalMemory`. Unlike `sysinfo::System::total_memory()`
+/// or `Win32_ComputerSystem.TotalPhysicalMemory`, this reads directly from
+/// SMBIOS and is unaffected by BIOS-level GPU UMA carveouts.
+///
+/// On AMD Ryzen AI MAX / MAX+ systems where users configure e.g. 96 GB as GPU
+/// UMA in BIOS, the OS only sees the remaining ~32 GB as system RAM, causing
+/// `sysinfo` to report 32 GB. `Win32_PhysicalMemory.Capacity` correctly sums
+/// all installed DIMMs (e.g. 128 GB) regardless of that carveout.
+///
+/// Returns `None` when not on Windows, PowerShell is unavailable, or the
+/// query fails; callers fall back to the sysinfo value.
+fn detect_windows_physical_total_ram_gb() -> Option<f64> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let bytes: u64 = text.trim().parse().ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// Read total system RAM from /proc/meminfo (Linux only).
@@ -1883,6 +2059,15 @@ pub fn gpu_memory_bandwidth_gbps(name: &str) -> Option<f64> {
     }
 
     // ── Apple Silicon (unified memory bandwidth) ───────────────────
+    if lower.contains("m5 max") {
+        return Some(614.0);
+    }
+    if lower.contains("m5 pro") {
+        return Some(307.0);
+    }
+    if lower.contains("m5") {
+        return Some(153.6);
+    }
     if lower.contains("m4 ultra") {
         return Some(819.0);
     }
@@ -2417,6 +2602,15 @@ mod tests {
             super::gpu_memory_bandwidth_gbps("Apple M4 Pro"),
             Some(273.0)
         );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("Apple M5 Max"),
+            Some(614.0)
+        );
+        assert_eq!(
+            super::gpu_memory_bandwidth_gbps("Apple M5 Pro"),
+            Some(307.0)
+        );
+        assert_eq!(super::gpu_memory_bandwidth_gbps("Apple M5"), Some(153.6));
     }
 
     #[test]
@@ -2503,6 +2697,17 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         ));
         assert!(SystemSpecs::is_software_vulkan_device("SwiftShader Device"));
         assert!(!SystemSpecs::is_software_vulkan_device("Adreno (TM) 740"));
+        // CPU compute devices exposed by Mesa/RADV must be filtered out
+        assert!(SystemSpecs::is_software_vulkan_device(
+            "AMD Ryzen 7 9800X3D 8-Core Processor (RADV RAPHAEL_MENDOCINO)"
+        ));
+        assert!(SystemSpecs::is_software_vulkan_device(
+            "AMD Ryzen 5 7600X 6-Core Processor (RADV RAPHAEL)"
+        ));
+        // Real discrete GPUs must still pass through
+        assert!(!SystemSpecs::is_software_vulkan_device(
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+        ));
     }
 
     #[test]
@@ -2512,6 +2717,46 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
             "nvidia geforce rtx 4090"
         ));
         assert!(!SystemSpecs::is_same_gpu_name("RTX", "RTX 4090"));
+    }
+
+    #[test]
+    fn test_is_same_gpu_name_amd_rocm_vs_vulkan_radv() {
+        // ROCm reports a family name listing multiple variants; RADV reports the
+        // specific model with a driver codename.  They should be treated as the
+        // same physical GPU.
+        assert!(SystemSpecs::is_same_gpu_name(
+            "Radeon RX 7700S/7600/7600S/7600M XT/PRO W7600",
+            "AMD Radeon RX 7600 XT (RADV NAVI33)"
+        ));
+        // A 7700 XT via RADV should also match the same ROCm family name.
+        assert!(SystemSpecs::is_same_gpu_name(
+            "Radeon RX 7700S/7600/7600S/7600M XT/PRO W7600",
+            "AMD Radeon RX 7700 XT (RADV NAVI33)"
+        ));
+        // Non-AMD GPUs must not be affected.
+        assert!(!SystemSpecs::is_same_gpu_name(
+            "NVIDIA GeForce RTX 3060",
+            "AMD Radeon RX 6600"
+        ));
+        // Different AMD model numbers must not match.
+        assert!(!SystemSpecs::is_same_gpu_name(
+            "AMD Radeon RX 6600",
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+        ));
+    }
+
+    #[test]
+    fn test_extract_gpu_model_numbers() {
+        assert_eq!(
+            SystemSpecs::extract_gpu_model_numbers("radeon rx 7700s 7600 7600s 7600m xt pro w7600"),
+            vec!["7700", "7600", "7600", "7600", "7600"]
+        );
+        assert_eq!(
+            SystemSpecs::extract_gpu_model_numbers("amd radeon rx 7600 xt radv navi33"),
+            vec!["7600"]
+        );
+        // Numbers shorter than 3 or longer than 5 digits are ignored.
+        assert!(SystemSpecs::extract_gpu_model_numbers("rx 42 xt").is_empty());
     }
 
     #[test]
@@ -2669,15 +2914,27 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
 
     #[test]
     fn test_amd_unified_memory_apu_detection() {
+        // Only Ryzen AI MAX / MAX+ have true unified memory
         assert!(super::is_amd_unified_memory_apu(
             "AMD Ryzen AI MAX+ 395 w/ Radeon 8060S"
         ));
-        assert!(super::is_amd_unified_memory_apu(
+        assert!(super::is_amd_unified_memory_apu("AMD Ryzen AI MAX 390"));
+        // Regular Ryzen AI chips are NOT unified memory APUs
+        assert!(!super::is_amd_unified_memory_apu(
             "AMD Ryzen AI 9 HX 370 w/ Radeon 890M"
         ));
-        assert!(super::is_amd_unified_memory_apu("AMD Ryzen AI 7 350"));
+        assert!(!super::is_amd_unified_memory_apu("AMD Ryzen AI 7 350"));
         assert!(!super::is_amd_unified_memory_apu("AMD Ryzen 9 7950X"));
         assert!(!super::is_amd_unified_memory_apu("Intel Core i9-14900K"));
+    }
+
+    // ── detect_windows_physical_total_ram_gb ─────────────────────────
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_windows_physical_total_ram_returns_none_on_non_windows() {
+        // On Linux/macOS the function must return None (it is Windows-only).
+        assert!(super::detect_windows_physical_total_ram_gb().is_none());
     }
 
     // ── bandwidth: RTX 20 series ─────────────────────────────────────
@@ -2913,6 +3170,10 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         assert!(!SystemSpecs::is_integrated_gpu_name(
             "Intel(R) Arc(TM) B580"
         ));
+        // Explicit "(integrated)" tag from APU detection
+        assert!(SystemSpecs::is_integrated_gpu_name(
+            "AMD Ryzen AI 9 HX 370 w/ Radeon 890M (integrated)"
+        ));
     }
 
     #[test]
@@ -3000,5 +3261,188 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         // GGUF quants have no CC restriction
         assert_eq!(super::quant_min_compute_capability("Q4_K_M"), None);
         assert_eq!(super::quant_min_compute_capability("Q8_0"), None);
+    }
+
+    #[test]
+    fn test_ram_override_updates_ram_values() {
+        let specs = SystemSpecs {
+            total_ram_gb: 32.0,
+            available_ram_gb: 24.0,
+            total_cpu_cores: 8,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(16.0),
+            total_gpu_vram_gb: Some(16.0),
+            gpu_name: Some("Test GPU".to_string()),
+            gpu_count: 1,
+            unified_memory: false,
+            backend: super::GpuBackend::Cuda,
+            gpus: vec![super::GpuInfo {
+                name: "Test GPU".to_string(),
+                vram_gb: Some(16.0),
+                backend: super::GpuBackend::Cuda,
+                count: 1,
+                unified_memory: false,
+            }],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+
+        let overridden = specs.with_ram_override(128.0);
+        assert_eq!(overridden.total_ram_gb, 128.0);
+        assert!((overridden.available_ram_gb - 115.2).abs() < 0.01);
+        // Discrete GPU VRAM unchanged
+        assert_eq!(overridden.gpu_vram_gb, Some(16.0));
+        assert_eq!(overridden.total_gpu_vram_gb, Some(16.0));
+    }
+
+    #[test]
+    fn test_ram_override_unified_memory_updates_gpu() {
+        let specs = SystemSpecs {
+            total_ram_gb: 36.0,
+            available_ram_gb: 30.0,
+            total_cpu_cores: 10,
+            cpu_name: "Apple M2 Max".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(36.0),
+            total_gpu_vram_gb: Some(36.0),
+            gpu_name: Some("Apple M2 Max".to_string()),
+            gpu_count: 1,
+            unified_memory: true,
+            backend: super::GpuBackend::Metal,
+            gpus: vec![super::GpuInfo {
+                name: "Apple M2 Max".to_string(),
+                vram_gb: Some(36.0),
+                backend: super::GpuBackend::Metal,
+                count: 1,
+                unified_memory: true,
+            }],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+
+        let overridden = specs.with_ram_override(96.0);
+        assert_eq!(overridden.total_ram_gb, 96.0);
+        assert_eq!(overridden.gpu_vram_gb, Some(96.0));
+        assert_eq!(overridden.total_gpu_vram_gb, Some(96.0));
+        assert_eq!(overridden.gpus[0].vram_gb, Some(96.0));
+    }
+
+    #[test]
+    fn test_cpu_core_override() {
+        let specs = SystemSpecs {
+            total_ram_gb: 32.0,
+            available_ram_gb: 24.0,
+            total_cpu_cores: 8,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: super::GpuBackend::CpuX86,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+
+        let overridden = specs.with_cpu_core_override(64);
+        assert_eq!(overridden.total_cpu_cores, 64);
+        // Other fields unchanged
+        assert_eq!(overridden.total_ram_gb, 32.0);
+        assert_eq!(overridden.available_ram_gb, 24.0);
+        assert!(!overridden.has_gpu);
+    }
+
+    #[test]
+    fn test_parse_rocm_smi_two_different_gpus() {
+        // Exact output from the issue reporter's system
+        let vram_text = "\
+GPU[0]          : VRAM Total Memory (B): 8573157376
+GPU[0]          : VRAM Total Used Memory (B): 60448768
+GPU[1]          : VRAM Total Memory (B): 34208743424
+GPU[1]          : VRAM Total Used Memory (B): 33732509696";
+
+        let product_text = "\
+GPU[0]          : Card Series:          AMD Radeon RX 7600
+GPU[0]          : Card Model:           0x7480
+GPU[0]          : Card Vendor:          Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]          : Card SKU:             D7451000
+GPU[1]          : Card Series:          AMD Radeon AI PRO R9700
+GPU[1]          : Card Model:           0x7551
+GPU[1]          : Card Vendor:          Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[1]          : Card SKU:             1E4990U";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, Some(product_text));
+
+        assert_eq!(gpus.len(), 2, "should detect two distinct GPUs");
+        assert!(
+            gpus.iter()
+                .any(|g| g.name.contains("RX 7600") && g.count == 1),
+            "should find RX 7600"
+        );
+        assert!(
+            gpus.iter()
+                .any(|g| g.name.contains("R9700") && g.count == 1),
+            "should find R9700"
+        );
+
+        let rx7600 = gpus.iter().find(|g| g.name.contains("RX 7600")).unwrap();
+        let r9700 = gpus.iter().find(|g| g.name.contains("R9700")).unwrap();
+        // RX 7600 ~8 GB, R9700 ~32 GB
+        assert!(rx7600.vram_gb.unwrap() > 7.0 && rx7600.vram_gb.unwrap() < 9.0);
+        assert!(r9700.vram_gb.unwrap() > 31.0 && r9700.vram_gb.unwrap() < 33.0);
+    }
+
+    #[test]
+    fn test_parse_rocm_smi_identical_gpus_grouped() {
+        let vram_text = "\
+GPU[0]          : VRAM Total Memory (B): 34208743424
+GPU[0]          : VRAM Total Used Memory (B): 100000
+GPU[1]          : VRAM Total Memory (B): 34208743424
+GPU[1]          : VRAM Total Used Memory (B): 200000";
+
+        let product_text = "\
+GPU[0]          : Card Series:          AMD Radeon AI PRO R9700
+GPU[1]          : Card Series:          AMD Radeon AI PRO R9700";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, Some(product_text));
+
+        assert_eq!(gpus.len(), 1, "identical GPUs should be grouped");
+        assert_eq!(gpus[0].count, 2);
+        assert!(gpus[0].name.contains("R9700"));
+    }
+
+    #[test]
+    fn test_parse_rocm_smi_igpu_filtered() {
+        // Simulate an APU iGPU (512 MB) alongside a discrete GPU
+        let vram_text = "\
+GPU[0]          : VRAM Total Memory (B): 536870912
+GPU[0]          : VRAM Total Used Memory (B): 100000
+GPU[1]          : VRAM Total Memory (B): 34208743424
+GPU[1]          : VRAM Total Used Memory (B): 200000";
+
+        let product_text = "\
+GPU[0]          : Card Series:          AMD Radeon Graphics
+GPU[1]          : Card Series:          AMD Radeon AI PRO R9700";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, Some(product_text));
+
+        assert_eq!(gpus.len(), 1, "iGPU should be filtered out");
+        assert!(gpus[0].name.contains("R9700"));
+    }
+
+    #[test]
+    fn test_parse_rocm_smi_no_product_text() {
+        let vram_text = "\
+GPU[0]          : VRAM Total Memory (B): 34208743424
+GPU[0]          : VRAM Total Used Memory (B): 200000";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, None);
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "AMD GPU");
+        assert!(gpus[0].vram_gb.unwrap() > 31.0);
     }
 }

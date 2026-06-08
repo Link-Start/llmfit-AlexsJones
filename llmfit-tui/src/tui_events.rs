@@ -5,8 +5,9 @@ use crate::tui_app::{App, InputMode};
 
 /// Poll for and handle events. Returns true if an event was processed.
 pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
-    // Always tick the pull progress (non-blocking)
+    // Always tick the pull progress and live-bench worker messages (non-blocking)
     app.tick_pull();
+    app.tick_bench();
 
     if event::poll(Duration::from_millis(50))?
         && let Event::Key(key) = event::read()?
@@ -31,6 +32,11 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
             InputMode::LicensePopup => handle_license_popup_mode(app, key),
             InputMode::RuntimePopup => handle_runtime_popup_mode(app, key),
             InputMode::HelpPopup => handle_help_popup_mode(app, key),
+            InputMode::Simulation => handle_simulation_mode(app, key),
+            InputMode::AdvancedConfig => handle_advanced_config_mode(app, key),
+            InputMode::DownloadManager => handle_download_manager_mode(app, key),
+            InputMode::FilterPopup => handle_filter_popup_mode(app, key),
+            InputMode::Benchmarks => handle_benchmarks_mode(app, key),
         }
         return Ok(true);
     }
@@ -38,17 +44,79 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
+    // Handle bench quit-confirmation first (overrides all other handlers)
+    if app.bench_confirm_quit {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.bench_confirm_quit = false;
+                app.close_bench();
+            }
+            _ => {
+                app.bench_confirm_quit = false;
+                app.bench_progress = format!(
+                    "{}/{} tests — Benchmarking...",
+                    app.bench_tests_done, app.bench_tests_total
+                );
+            }
+        }
+        return;
+    }
+
     match key.code {
         // Quit
         KeyCode::Char('q') | KeyCode::Esc => {
-            if app.show_multi_compare {
+            if app.show_bench {
+                if app.bench_show_detail {
+                    app.bench_show_detail = false;
+                } else if app.bench_running {
+                    app.bench_confirm_quit = true;
+                    app.bench_progress =
+                        "Inference bench running! Press q again to exit, any key to cancel"
+                            .to_string();
+                } else {
+                    app.close_bench();
+                }
+            } else if app.show_downloads {
+                app.close_downloads();
+            } else if app.show_multi_compare {
                 app.close_multi_compare();
             } else if app.show_detail {
                 app.show_detail = false;
             } else if app.show_compare {
                 app.show_compare = false;
             } else {
+                app.save_filters();
                 app.should_quit = true;
+            }
+        }
+
+        // Live bench view navigation (only active when bench view is open)
+        KeyCode::Char('j') | KeyCode::Down if app.show_bench => {
+            if app.bench_show_detail {
+                app.live_bench_scroll += 1;
+            } else {
+                let max = app.bench_model_status.len().saturating_sub(1);
+                if app.bench_selected_row < max {
+                    app.bench_selected_row += 1;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up if app.show_bench => {
+            if app.bench_show_detail {
+                app.live_bench_scroll = app.live_bench_scroll.saturating_sub(1);
+            } else if app.bench_selected_row > 0 {
+                app.bench_selected_row -= 1;
+            }
+        }
+        KeyCode::Char('r') if app.show_bench => {
+            app.toggle_bench_view();
+        }
+        KeyCode::Enter if app.show_bench => {
+            if app.bench_show_detail {
+                app.bench_show_detail = false;
+            } else {
+                app.bench_show_detail = true;
+                app.live_bench_scroll = 0;
             }
         }
 
@@ -64,9 +132,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
-        KeyCode::Home | KeyCode::Char('g') => app.home(),
-        KeyCode::End | KeyCode::Char('G') => app.end(),
-
+        KeyCode::Home | KeyCode::Char('g') => app.cycle_top_bottom(),
         // Visual mode
         KeyCode::Char('v') => app.enter_visual_mode(),
 
@@ -78,6 +144,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // Fit filter
         KeyCode::Char('f') => app.cycle_fit_filter(),
+
+        // Filter popup (range filters, sort direction, fit)
+        KeyCode::Char('F') => app.open_filter_popup(),
 
         // Availability filter
         KeyCode::Char('a') => app.cycle_availability_filter(),
@@ -100,6 +169,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('C') => app.open_capability_popup(),
         KeyCode::Char('L') => app.open_license_popup(),
         KeyCode::Char('R') => app.open_runtime_popup(),
+        KeyCode::Char('S') => app.open_simulation_popup(),
         KeyCode::Char('h') => app.open_help_popup(),
 
         // Installed-first sort toggle (any provider)
@@ -107,7 +177,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             if app.ollama_available
                 || app.mlx_available
                 || app.llamacpp_available
-                || app.lmstudio_available =>
+                || app.lmstudio_available
+                || app.vllm_available =>
         {
             app.toggle_installed_first()
         }
@@ -117,7 +188,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             if app.ollama_available
                 || app.mlx_available
                 || app.llamacpp_available
-                || app.lmstudio_available =>
+                || app.lmstudio_available
+                || app.vllm_available =>
         {
             if app.pull_active.is_none() {
                 app.start_download();
@@ -129,10 +201,24 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             if app.ollama_available
                 || app.mlx_available
                 || app.llamacpp_available
-                || app.lmstudio_available =>
+                || app.lmstudio_available
+                || app.vllm_available =>
         {
             app.refresh_installed()
         }
+
+        // Download manager view
+        KeyCode::Char('D') => app.toggle_downloads(),
+
+        // Benchmarks view (localmaxxing.com community leaderboard)
+        KeyCode::Char('b') => app.open_benchmarks(),
+
+        // Live inference-bench view (llmfit bench — I=open, I again=rerun)
+        KeyCode::Char('I') if app.show_bench => app.rerun_bench(),
+        KeyCode::Char('I') => app.open_bench(),
+
+        // Advanced Config popup
+        KeyCode::Char('A') => app.open_advanced_config_popup(),
 
         // Detail view
         KeyCode::Enter => app.toggle_detail(),
@@ -159,8 +245,7 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
-        KeyCode::Home | KeyCode::Char('g') => app.home(),
-        KeyCode::End | KeyCode::Char('G') => app.end(),
+        KeyCode::Home | KeyCode::Char('g') => app.cycle_top_bottom(),
 
         // Mark all selected for compare
         KeyCode::Char('m') => app.mark_selected_for_compare(),
@@ -203,7 +288,10 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
             app.clear_search();
         }
 
-        KeyCode::Char(c) => app.search_input(c),
+        KeyCode::Left => app.search_cursor_left(),
+        KeyCode::Right => app.search_cursor_right(),
+
+        KeyCode::Char(c) if allows_search_text_input(key.modifiers) => app.search_input(c),
 
         // Allow navigation while searching
         KeyCode::Up => app.move_up(),
@@ -214,19 +302,41 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_provider_popup_mode(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('P') | KeyCode::Char('q') => app.close_provider_popup(),
+        KeyCode::Esc => app.close_provider_popup(),
 
-        KeyCode::Up | KeyCode::Char('k') => app.provider_popup_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.provider_popup_down(),
+        KeyCode::Up if shift => app.provider_popup_up(25),
+        KeyCode::Down if shift => app.provider_popup_down(25),
+        KeyCode::Up => app.provider_popup_up(1),
+        KeyCode::Down => app.provider_popup_down(1),
 
-        KeyCode::Char(' ') | KeyCode::Enter => app.provider_popup_toggle(),
+        // Space toggles too (provider names never contain spaces).
+        KeyCode::Enter | KeyCode::Char(' ') => app.provider_popup_toggle(),
 
-        KeyCode::Char('a') => app.provider_popup_select_all(),
-        KeyCode::Char('c') => app.provider_popup_clear_all(),
+        KeyCode::Backspace => app.provider_search_backspace(),
+
+        // Ctrl shortcuts (typing plain letters filters, so these are modified).
+        KeyCode::Char('u') if ctrl => app.provider_search_clear(),
+        KeyCode::Char('a') if ctrl => app.provider_popup_select_all(),
+        KeyCode::Char('n') if ctrl => app.provider_popup_clear_all(),
+
+        // Any other printable character filters the provider list.
+        KeyCode::Char(c) if !ctrl => app.provider_search_input(c),
 
         _ => {}
     }
+}
+
+fn allows_search_text_input(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    )
 }
 
 fn handle_plan_mode(app: &mut App, key: KeyEvent) {
@@ -373,5 +483,253 @@ fn handle_help_popup_mode(app: &mut App, key: KeyEvent) {
             app.help_scroll += 1;
         }
         _ => {}
+    }
+}
+
+fn handle_simulation_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_simulation_popup(),
+
+        // Apply simulation
+        KeyCode::Enter => app.apply_simulation(),
+
+        // Reset to real hardware
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.reset_simulation();
+            app.close_simulation_popup();
+        }
+
+        // Field navigation
+        KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => app.sim_next_field(),
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => app.sim_prev_field(),
+
+        // Cursor movement within field
+        KeyCode::Left => app.sim_cursor_left(),
+        KeyCode::Right => app.sim_cursor_right(),
+
+        // Editing
+        KeyCode::Backspace => app.sim_backspace(),
+        KeyCode::Delete => app.sim_delete(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.sim_clear_field()
+        }
+
+        // Character input (digits and decimal point)
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => app.sim_input(c),
+
+        _ => {}
+    }
+}
+
+fn handle_advanced_config_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_advanced_config_popup(),
+
+        // Apply config changes
+        KeyCode::Enter => app.apply_advanced_config(),
+
+        // Field navigation
+        KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => app.adv_config_next_field(),
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => app.adv_config_prev_field(),
+
+        // Cursor movement within field
+        KeyCode::Left => app.adv_config_cursor_left(),
+        KeyCode::Right => app.adv_config_cursor_right(),
+
+        // Editing
+        KeyCode::Backspace => app.adv_config_backspace(),
+        KeyCode::Delete => app.adv_config_delete(),
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.reset_advanced_config()
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.adv_config_clear_field()
+        }
+
+        // Character input (digits and decimal point)
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => app.adv_config_input(c),
+
+        _ => {}
+    }
+}
+
+fn handle_download_manager_mode(app: &mut App, key: KeyEvent) {
+    use crate::tui_app::DownloadManagerFocus;
+
+    // Handle delete confirmation first
+    if app.dm_confirm_delete {
+        match key.code {
+            KeyCode::Char('y') => {
+                app.delete_selected_download();
+                app.dm_confirm_delete = false;
+            }
+            _ => app.dm_confirm_delete = false,
+        }
+        return;
+    }
+
+    // Handle directory editing mode
+    if app.dm_editing_dir {
+        match key.code {
+            KeyCode::Esc => {
+                app.dm_editing_dir = false;
+            }
+            KeyCode::Enter => {
+                app.apply_download_dir();
+                app.dm_editing_dir = false;
+            }
+            KeyCode::Backspace => {
+                app.dm_dir_backspace();
+            }
+            KeyCode::Delete => {
+                app.dm_dir_delete();
+            }
+            KeyCode::Left => {
+                app.dm_dir_cursor_left();
+            }
+            KeyCode::Right => {
+                app.dm_dir_cursor_right();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.dm_dir_clear();
+            }
+            KeyCode::Char(c) => {
+                app.insert_dm_dir_char(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        // Close
+        KeyCode::Esc | KeyCode::Char('D') | KeyCode::Char('q') => app.close_downloads(),
+
+        // Focus cycling
+        KeyCode::Tab => app.dm_focus = app.dm_focus.next(),
+        KeyCode::BackTab => app.dm_focus = app.dm_focus.prev(),
+
+        // Navigation within history
+        KeyCode::Up | KeyCode::Char('k') if app.dm_focus == DownloadManagerFocus::History => {
+            if app.dm_history_cursor > 0 {
+                app.dm_history_cursor -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.dm_focus == DownloadManagerFocus::History => {
+            let len = app.download_history.records.len();
+            if len > 0 && app.dm_history_cursor < len - 1 {
+                app.dm_history_cursor += 1;
+            }
+        }
+
+        // Delete model
+        KeyCode::Char('x') if app.dm_focus == DownloadManagerFocus::History => {
+            if !app.download_history.records.is_empty() {
+                app.dm_confirm_delete = true;
+            }
+        }
+
+        // Edit download directory
+        KeyCode::Char('e') if app.dm_focus == DownloadManagerFocus::Config => {
+            app.start_editing_download_dir();
+        }
+
+        _ => {}
+    }
+}
+
+fn handle_filter_popup_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_filter_popup(),
+
+        KeyCode::Enter => app.apply_filter_popup(),
+
+        // Field navigation
+        KeyCode::Tab | KeyCode::Down => app.filter_next_field(),
+        KeyCode::BackTab | KeyCode::Up => app.filter_prev_field(),
+
+        // Cursor movement within field
+        KeyCode::Left => app.filter_cursor_left(),
+        KeyCode::Right => app.filter_cursor_right(),
+
+        // Editing
+        KeyCode::Backspace => app.filter_backspace(),
+        KeyCode::Delete => app.filter_delete(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if matches!(
+                app.filter_field,
+                crate::tui_app::FilterPopupField::SortDirection
+                    | crate::tui_app::FilterPopupField::FitFilter
+            ) {
+                return;
+            }
+            app.filter_clear_active_input();
+        }
+
+        // Sort direction toggle
+        KeyCode::Char(' ')
+            if app.filter_field == crate::tui_app::FilterPopupField::SortDirection =>
+        {
+            app.filter_toggle_sort_direction()
+        }
+
+        // Fit filter cycling
+        KeyCode::Char(' ') if app.filter_field == crate::tui_app::FilterPopupField::FitFilter => {
+            app.cycle_filter_fit()
+        }
+
+        // Numeric input
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => app.filter_input(c),
+
+        _ => {}
+    }
+}
+
+fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
+    // Hardware picker sub-modal takes priority when open
+    if app.bench_hw_picker_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('H') => app.close_bench_hw_picker(),
+            KeyCode::Up | KeyCode::Char('k') => app.bench_hw_picker_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.bench_hw_picker_down(),
+            KeyCode::Enter | KeyCode::Char(' ') => app.bench_hw_picker_select(),
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => app.close_benchmarks(),
+        KeyCode::Up | KeyCode::Char('k') => app.bench_move_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.bench_move_down(),
+        KeyCode::Char('r') => app.bench_refresh(),
+        KeyCode::Char('H') => app.open_bench_hw_picker(),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_text_accepts_unmodified_and_shift_modified_input() {
+        assert!(allows_search_text_input(KeyModifiers::NONE));
+        assert!(allows_search_text_input(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn search_text_rejects_modified_navigation_artifacts() {
+        assert!(!allows_search_text_input(KeyModifiers::ALT));
+        assert!(!allows_search_text_input(KeyModifiers::SUPER));
+        assert!(!allows_search_text_input(KeyModifiers::CONTROL));
+        assert!(!allows_search_text_input(KeyModifiers::META));
+        assert!(!allows_search_text_input(KeyModifiers::HYPER));
+        assert!(!allows_search_text_input(
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        ));
+        assert!(!allows_search_text_input(
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        ));
     }
 }
